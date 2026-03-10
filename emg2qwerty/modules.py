@@ -278,3 +278,43 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+
+class RecurrentEncoder(nn.Module):
+    """A recurrent encoder wrapper around PyTorch RNN/GRU/LSTM modules.
+
+    Inputs should be of shape (T, N, input_size) and outputs will be
+    (T, N, hidden_size * num_directions).
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 2,
+        rnn_type: str = "gru",
+        bidirectional: bool = True,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        rnn_type = rnn_type.lower()
+        rnn_map = {"rnn": nn.RNN, "gru": nn.GRU, "lstm": nn.LSTM}
+        if rnn_type not in rnn_map:
+            raise ValueError(f"Unsupported rnn_type: {rnn_type}")
+
+        self.rnn_type = rnn_type
+        self.hidden_size = hidden_size
+        self.num_directions = 2 if bidirectional else 1
+
+        rnn_dropout = dropout if num_layers > 1 else 0.0
+        self.rnn = rnn_map[rnn_type](
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+            dropout=rnn_dropout,
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        outputs, _ = self.rnn(inputs)
+        return outputs

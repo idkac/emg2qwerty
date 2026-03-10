@@ -15,6 +15,61 @@ _Last updated 2/13/2025_
     - **Q: How do we update these configuration files?** A: Note the structure of YAML files include basic key-value pairs (i.e. ```<key>: <value>```) and hierarchical structure. So, for instance, if we wanted to update the ```mlp_features``` hyperparameter of the ```TDSConvCTCModule```, we would change the value at line 5 of ```config/model/tds_conv_ctc.yaml``` (under ```module```). _Read more details [here](https://pytorch-lightning.readthedocs.io/en/1.3.8/common/lightning_cli.html)._
     - **Q: Where do we configure data splitting?** A: Refer to ```config/user/single_user.yaml```. Be careful with your edits, so that you don't accidentally move the test data into your training set.
 
+## Running The Baseline And Measuring Changes
+This repo uses Hydra configs. The default baseline is `config/model/tds_conv_ctc.yaml` with the single-user split in `config/user/single_user.yaml`.
+
+### 1) Run the baseline model
+GPU is strongly recommended. On macOS, `CTCLoss` may not be available, so run on Colab or a GPU machine when possible.
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user \
+  model=tds_conv_ctc \
+  trainer.accelerator=gpu trainer.devices=1
+```
+
+The output will include `val/CER` and `test/CER`. Use those as your baseline reference.
+
+### 2) Swap model architectures
+To compare recurrent baselines, use the provided model configs:
+
+```bash
+# RNN
+python -m emg2qwerty.train user=single_user model=rnn_ctc
+
+# LSTM
+python -m emg2qwerty.train user=single_user model=lstm_ctc
+
+# GRU
+python -m emg2qwerty.train user=single_user model=gru_ctc
+```
+
+Keep the dataset split and training hyperparameters fixed so that CER changes are attributable to the architecture.
+
+### 3) Change preprocessing or augmentation
+Transforms are defined in `config/transforms/log_spectrogram.yaml`. You can override specific values at the CLI:
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user model=tds_conv_ctc \
+  transforms.specaug.n_time_masks=0 \
+  transforms.specaug.n_freq_masks=0
+```
+
+Track how `val/CER` changes relative to the baseline.
+
+### 4) Vary data amount
+Create new user configs (for example, `config/user/single_user_50.yaml`) that include fewer training sessions. Then run:
+
+```bash
+python -m emg2qwerty.train user=single_user_50 model=tds_conv_ctc
+```
+
+Plot CER versus percent of training sessions used.
+
+### 5) Vary channels or sampling rate
+The notebooks in `notebooks/` include helper transforms for channel masking and temporal downsampling that let you keep model shapes fixed while simulating fewer channels or lower sampling rate. Use those notebooks for controlled sweeps and record CER trends.
+
 # emg2qwerty
 [ [`Paper`](https://arxiv.org/abs/2410.20081) ] [ [`Dataset`](https://fb-ctrl-oss.s3.amazonaws.com/emg2qwerty/emg2qwerty-data-2021-08.tar.gz) ] [ [`Blog`](https://ai.meta.com/blog/open-sourcing-surface-electromyography-datasets-neurips-2024/) ] [ [`BibTeX`](#citing-emg2qwerty) ]
 
