@@ -44,6 +44,12 @@ python -m emg2qwerty.train user=single_user model=lstm_ctc
 python -m emg2qwerty.train user=single_user model=gru_ctc
 ```
 
+Transformer baseline:
+
+```bash
+python -m emg2qwerty.train user=single_user model=transformer_ctc
+```
+
 Keep the dataset split and training hyperparameters fixed so that CER changes are attributable to the architecture.
 
 ### 3) Change preprocessing or augmentation
