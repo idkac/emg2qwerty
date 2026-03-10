@@ -47,7 +47,6 @@ logs/
 lightning_logs/
 
 # Data
-data
 bids_data
 *.tar.gz
 
