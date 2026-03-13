@@ -96,6 +96,75 @@ class Compose:
 
 
 @dataclass
+class ChannelMask:
+    """Zero out all but a configurable subset of electrode channels.
+
+    This keeps the tensor shape fixed so existing model configs remain valid,
+    while allowing channel-count ablations from Hydra overrides.
+
+    Args:
+        keep_indices (list): Explicit channel indices to keep. If provided,
+            this takes precedence over ``num_channels``.
+        num_channels (int): Number of leading channels to keep when
+            ``keep_indices`` is empty. Set to ``None`` to disable masking.
+        randomize (bool): If True, sample the kept channels once using
+            ``seed`` instead of taking the leading ``num_channels``.
+        seed (int): Optional RNG seed for deterministic randomized masks.
+        channel_dim (int): Electrode channel dimension. (default: -1)
+    """
+
+    keep_indices: Sequence[int] = ()
+    num_channels: int | None = None
+    randomize: bool = False
+    seed: int | None = None
+    channel_dim: int = -1
+
+    def __post_init__(self) -> None:
+        self._rng = np.random.default_rng(self.seed)
+        self._cached_keep_indices: tuple[int, ...] | None = None
+
+    def _resolve_keep_indices(self, num_available: int) -> tuple[int, ...] | None:
+        if self.keep_indices:
+            keep_indices = tuple(int(idx) for idx in self.keep_indices)
+        elif self.num_channels is None:
+            return None
+        else:
+            assert self.num_channels > 0, "num_channels must be positive"
+            assert (
+                self.num_channels <= num_available
+            ), "num_channels cannot exceed available channels"
+            if self.randomize:
+                if self._cached_keep_indices is None:
+                    sampled = self._rng.choice(
+                        num_available, size=self.num_channels, replace=False
+                    )
+                    self._cached_keep_indices = tuple(sorted(int(idx) for idx in sampled))
+                keep_indices = self._cached_keep_indices
+            else:
+                keep_indices = tuple(range(self.num_channels))
+
+        assert len(set(keep_indices)) == len(keep_indices), "keep_indices must be unique"
+        assert all(
+            0 <= idx < num_available for idx in keep_indices
+        ), "keep_indices out of range"
+        if len(keep_indices) == num_available:
+            return None
+        return keep_indices
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        num_available = tensor.shape[self.channel_dim]
+        keep_indices = self._resolve_keep_indices(num_available)
+        if keep_indices is None:
+            return tensor
+
+        mask = torch.zeros(num_available, dtype=tensor.dtype, device=tensor.device)
+        mask[torch.as_tensor(keep_indices, device=tensor.device)] = 1
+        mask_shape = [1] * tensor.ndim
+        mask_shape[self.channel_dim] = num_available
+        return tensor * mask.reshape(mask_shape)
+
+
+@dataclass
 class RandomBandRotation:
     """Applies band rotation augmentation by shifting the electrode channels
     by an offset value randomly chosen from ``offsets``. By default, assumes
@@ -152,6 +221,44 @@ class TemporalAlignmentJitter:
             right = right[-offset:]
 
         return torch.stack([left, right], dim=self.stack_dim)
+
+
+@dataclass
+class Resample:
+    """Resample a time-first EMG tensor to a target sampling rate.
+
+    Uses torchaudio's band-limited sinc resampler, so lowering the rate
+    also applies the low-pass filtering needed to avoid aliasing.
+
+    Args:
+        orig_freq (int): Source sampling rate in Hz.
+        new_freq (int): Target sampling rate in Hz.
+        time_dim (int): Time dimension in the input tensor. (default: 0)
+    """
+
+    orig_freq: int
+    new_freq: int
+    time_dim: int = 0
+
+    def __post_init__(self) -> None:
+        assert self.orig_freq > 0, "orig_freq must be positive"
+        assert self.new_freq > 0, "new_freq must be positive"
+        assert (
+            self.new_freq <= self.orig_freq
+        ), "new_freq cannot exceed orig_freq for this experiment"
+        self.resampler = (
+            torchaudio.transforms.Resample(self.orig_freq, self.new_freq)
+            if self.orig_freq != self.new_freq
+            else None
+        )
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.resampler is None:
+            return tensor
+
+        x = tensor.float().movedim(self.time_dim, -1)
+        y = self.resampler(x)
+        return y.movedim(-1, self.time_dim)
 
 
 @dataclass

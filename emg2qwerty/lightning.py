@@ -44,11 +44,13 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         train_transform: Transform[np.ndarray, torch.Tensor],
         val_transform: Transform[np.ndarray, torch.Tensor],
         test_transform: Transform[np.ndarray, torch.Tensor],
+        full_session_eval: bool = True,
     ) -> None:
         super().__init__()
 
         self.window_length = window_length
         self.padding = padding
+        self.full_session_eval = full_session_eval
 
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -91,10 +93,10 @@ class WindowedEMGDataModule(pl.LightningDataModule):
                 WindowedEMGDataset(
                     hdf5_path,
                     transform=self.test_transform,
-                    # Feed the entire session at once without windowing/padding
-                    # at test time for more realism
-                    window_length=None,
-                    padding=(0, 0),
+                    # Transformer attention is quadratic in sequence length, so
+                    # allow opting into the same fixed windows used for train/val.
+                    window_length=None if self.full_session_eval else self.window_length,
+                    padding=(0, 0) if self.full_session_eval else self.padding,
                     jitter=False,
                 )
                 for hdf5_path in self.test_sessions
@@ -109,7 +111,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -120,22 +122,20 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
     def test_dataloader(self) -> DataLoader:
-        # Test dataset does not involve windowing and entire sessions are
-        # fed at once. Limit batch size to 1 to fit within GPU memory and
-        # avoid any influence of padding (while collating multiple batch items)
-        # in test scores.
+        # Full-session evaluation can require batch size 1 for memory reasons,
+        # while windowed evaluation can reuse the configured batch size.
         return DataLoader(
             self.test_dataset,
-            batch_size=1,
+            batch_size=1 if self.full_session_eval else self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
 
@@ -336,8 +336,18 @@ class RecurrentCTCModule(pl.LightningModule):
             }
         )
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.model(inputs)
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        input_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = inputs
+        for module in self.model:
+            if isinstance(module, RecurrentEncoder):
+                x = module(x, input_lengths=input_lengths)
+            else:
+                x = module(x)
+        return x
 
     def _step(
         self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
@@ -348,10 +358,157 @@ class RecurrentCTCModule(pl.LightningModule):
         target_lengths = batch["target_lengths"]
         N = len(input_lengths)  # batch_size
 
-        emissions = self.forward(inputs)
+        emissions = self.forward(inputs, input_lengths)
 
         T_diff = inputs.shape[0] - emissions.shape[0]
         emission_lengths = input_lengths - T_diff
+
+        loss = self.ctc_loss(
+            log_probs=emissions,
+            targets=targets.transpose(0, 1),
+            input_lengths=emission_lengths,
+            target_lengths=target_lengths,
+        )
+
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets = targets.detach().cpu().numpy()
+        target_lengths = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            target = LabelData.from_labels(targets[: target_lengths[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
+
+    def _epoch_end(self, phase: str) -> None:
+        metrics = self.metrics[f"{phase}_metrics"]
+        self.log_dict(metrics.compute(), sync_dist=True)
+        metrics.reset()
+
+    def training_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("train", *args, **kwargs)
+
+    def validation_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("val", *args, **kwargs)
+
+    def test_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("test", *args, **kwargs)
+
+    def on_train_epoch_end(self) -> None:
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self) -> None:
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self) -> None:
+        self._epoch_end("test")
+
+    def configure_optimizers(self) -> dict[str, Any]:
+        return utils.instantiate_optimizer_and_scheduler(
+            self.parameters(),
+            optimizer_config=self.hparams.optimizer,
+            lr_scheduler_config=self.hparams.lr_scheduler,
+        )
+
+
+class TDSConvRecurrentCTCModule(pl.LightningModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        rnn_type: str,
+        hidden_size: int,
+        num_layers: int,
+        bidirectional: bool,
+        dropout: float,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        self.rnn_output_size = hidden_size * (2 if bidirectional else 1)
+
+        self.spectrogram_norm = SpectrogramNorm(
+            channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS
+        )
+        self.multiband_mlp = MultiBandRotationInvariantMLP(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            num_bands=self.NUM_BANDS,
+        )
+        self.temporal_encoder = TDSConvEncoder(
+            num_features=num_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+        )
+        self.recurrent_encoder = RecurrentEncoder(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            rnn_type=rnn_type,
+            bidirectional=bidirectional,
+            dropout=dropout,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(self.rnn_output_size, charset().num_classes)
+        self.log_softmax = nn.LogSoftmax(dim=-1)
+
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
+        self.decoder = instantiate(decoder)
+
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict(
+            {
+                f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+                for phase in ["train", "val", "test"]
+            }
+        )
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        input_lengths: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        x = self.spectrogram_norm(inputs)
+        x = self.multiband_mlp(x)
+        x = torch.flatten(x, start_dim=2)
+        x = self.temporal_encoder(x)
+
+        encoded_lengths = None
+        if input_lengths is not None:
+            time_diff = inputs.shape[0] - x.shape[0]
+            encoded_lengths = input_lengths - time_diff
+
+        x = self.recurrent_encoder(x, input_lengths=encoded_lengths)
+        x = self.dropout(x)
+        x = self.classifier(x)
+        x = self.log_softmax(x)
+        return x, encoded_lengths
+
+    def _step(
+        self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
+    ) -> torch.Tensor:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)
+
+        emissions, emission_lengths = self.forward(inputs, input_lengths)
+        assert emission_lengths is not None
 
         loss = self.ctc_loss(
             log_probs=emissions,
@@ -460,8 +617,18 @@ class TransformerCTCModule(pl.LightningModule):
             }
         )
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.model(inputs)
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        input_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = inputs
+        for module in self.model:
+            if isinstance(module, TransformerEncoder):
+                x = module(x, input_lengths=input_lengths)
+            else:
+                x = module(x)
+        return x
 
     def _step(
         self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
@@ -472,7 +639,7 @@ class TransformerCTCModule(pl.LightningModule):
         target_lengths = batch["target_lengths"]
         N = len(input_lengths)
 
-        emissions = self.forward(inputs)
+        emissions = self.forward(inputs, input_lengths)
 
         T_diff = inputs.shape[0] - emissions.shape[0]
         emission_lengths = input_lengths - T_diff
@@ -489,38 +656,38 @@ class TransformerCTCModule(pl.LightningModule):
             emission_lengths=emission_lengths.detach().cpu().numpy(),
         )
 
-        metrics = self.metrics[f\"{phase}_metrics\"]
+        metrics = self.metrics[f"{phase}_metrics"]
         targets = targets.detach().cpu().numpy()
         target_lengths = target_lengths.detach().cpu().numpy()
         for i in range(N):
             target = LabelData.from_labels(targets[: target_lengths[i], i])
             metrics.update(prediction=predictions[i], target=target)
 
-        self.log(f\"{phase}/loss\", loss, batch_size=N, sync_dist=True)
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
         return loss
 
     def _epoch_end(self, phase: str) -> None:
-        metrics = self.metrics[f\"{phase}_metrics\"]
+        metrics = self.metrics[f"{phase}_metrics"]
         self.log_dict(metrics.compute(), sync_dist=True)
         metrics.reset()
 
     def training_step(self, *args, **kwargs) -> torch.Tensor:
-        return self._step(\"train\", *args, **kwargs)
+        return self._step("train", *args, **kwargs)
 
     def validation_step(self, *args, **kwargs) -> torch.Tensor:
-        return self._step(\"val\", *args, **kwargs)
+        return self._step("val", *args, **kwargs)
 
     def test_step(self, *args, **kwargs) -> torch.Tensor:
-        return self._step(\"test\", *args, **kwargs)
+        return self._step("test", *args, **kwargs)
 
     def on_train_epoch_end(self) -> None:
-        self._epoch_end(\"train\")
+        self._epoch_end("train")
 
     def on_validation_epoch_end(self) -> None:
-        self._epoch_end(\"val\")
+        self._epoch_end("val")
 
     def on_test_epoch_end(self) -> None:
-        self._epoch_end(\"test\")
+        self._epoch_end("test")
 
     def configure_optimizers(self) -> dict[str, Any]:
         return utils.instantiate_optimizer_and_scheduler(

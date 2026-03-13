@@ -1,10 +1,15 @@
 # @package _global_
 module:
-  _target_: emg2qwerty.lightning.TDSConvCTCModule
+  _target_: emg2qwerty.lightning.TDSConvRecurrentCTCModule
   in_features: ${spectrogram_in_features:${logspec.n_fft},16}  # Channel masking keeps shape fixed
   mlp_features: [384]
-  block_channels: [24, 24, 24, 24]
-  kernel_width: 32  # Total temporal receptive field of 125 samples given 4 layers
+  block_channels: [24, 24]
+  kernel_width: 32
+  rnn_type: lstm
+  hidden_size: 256
+  num_layers: 2
+  bidirectional: true
+  dropout: 0.2
 
 datamodule:
   _target_: emg2qwerty.lightning.WindowedEMGDataModule

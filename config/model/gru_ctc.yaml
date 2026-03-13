@@ -1,7 +1,7 @@
 # @package _global_
 module:
   _target_: emg2qwerty.lightning.RecurrentCTCModule
-  in_features: 528  # freq * channels = (n_fft // 2 + 1) * 16
+  in_features: ${spectrogram_in_features:${logspec.n_fft},16}  # Channel masking keeps shape fixed
   mlp_features: [384]
   rnn_type: gru
   hidden_size: 256

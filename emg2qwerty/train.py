@@ -125,5 +125,9 @@ def main(config: DictConfig):
 
 
 if __name__ == "__main__":
-    OmegaConf.register_new_resolver("cpus_per_task", utils.cpus_per_task)
+    OmegaConf.register_new_resolver("cpus_per_task", utils.cpus_per_task, replace=True)
+    OmegaConf.register_new_resolver("scale_by_rate", utils.scale_by_rate, replace=True)
+    OmegaConf.register_new_resolver(
+        "spectrogram_in_features", utils.spectrogram_in_features, replace=True
+    )
     main()

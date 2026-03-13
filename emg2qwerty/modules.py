@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -315,8 +316,25 @@ class RecurrentEncoder(nn.Module):
             dropout=rnn_dropout,
         )
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        outputs, _ = self.rnn(inputs)
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        input_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if input_lengths is None:
+            outputs, _ = self.rnn(inputs)
+            return outputs
+
+        packed_inputs = nn.utils.rnn.pack_padded_sequence(
+            inputs,
+            lengths=input_lengths.detach().to(dtype=torch.int64, device="cpu"),
+            enforce_sorted=False,
+        )
+        packed_outputs, _ = self.rnn(packed_inputs)
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_outputs,
+            total_length=inputs.size(0),
+        )
         return outputs
 
 
@@ -325,20 +343,35 @@ class PositionalEncoding(nn.Module):
 
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000) -> None:
         super().__init__()
+        self.d_model = d_model
         self.dropout = nn.Dropout(p=dropout)
+        self.register_buffer("pe", self._build_pe(max_len), persistent=False)
 
-        position = torch.arange(max_len).unsqueeze(1)
+    def _build_pe(
+        self,
+        max_len: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        position = torch.arange(max_len, device=device, dtype=dtype).unsqueeze(1)
         div_term = torch.exp(
-            torch.arange(0, d_model, 2) * (-torch.log(torch.tensor(10000.0)) / d_model)
+            torch.arange(0, self.d_model, 2, device=device, dtype=dtype)
+            * (-math.log(10000.0) / self.d_model)
         )
-        pe = torch.zeros(max_len, 1, d_model)
+        pe = torch.zeros(max_len, 1, self.d_model, device=device, dtype=dtype)
         pe[:, 0, 0::2] = torch.sin(position * div_term)
         pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
+        return pe
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (T, N, C)
-        x = x + self.pe[: x.size(0)]
+        if self.pe.size(0) < x.size(0):
+            self.pe = self._build_pe(
+                x.size(0),
+                device=self.pe.device,
+                dtype=self.pe.dtype,
+            )
+        x = x + self.pe[: x.size(0)].to(device=x.device, dtype=x.dtype)
         return self.dropout(x)
 
 
@@ -366,6 +399,16 @@ class TransformerEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        input_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         x = self.pos_encoding(inputs)
-        return self.encoder(x)
+        src_key_padding_mask = None
+        if input_lengths is not None:
+            timesteps = torch.arange(inputs.size(0), device=inputs.device)
+            src_key_padding_mask = timesteps.unsqueeze(0) >= input_lengths.to(
+                device=inputs.device
+            ).unsqueeze(1)
+        return self.encoder(x, src_key_padding_mask=src_key_padding_mask)

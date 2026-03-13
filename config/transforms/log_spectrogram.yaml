@@ -1,7 +1,17 @@
 # @package _global_
+raw_sample_rate_hz: 2000
+effective_sample_rate_hz: ${raw_sample_rate_hz}
+
 to_tensor:
   _target_: emg2qwerty.transforms.ToTensor
   fields: [emg_left, emg_right]
+
+channel_mask:
+  _target_: emg2qwerty.transforms.ChannelMask
+  keep_indices: []
+  num_channels: null
+  randomize: false
+  seed: ${seed}
 
 band_rotation:
   _target_: emg2qwerty.transforms.ForEach  # i.i.d rotation offset for each band
@@ -9,14 +19,19 @@ band_rotation:
     _target_: emg2qwerty.transforms.RandomBandRotation
     offsets: [-1, 0, 1]
 
+resample:
+  _target_: emg2qwerty.transforms.Resample
+  orig_freq: ${raw_sample_rate_hz}
+  new_freq: ${effective_sample_rate_hz}
+
 temporal_jitter:
   _target_: emg2qwerty.transforms.TemporalAlignmentJitter
-  max_offset: 120  # Max 60ms jitter for 2kHz EMG
+  max_offset: ${scale_by_rate:120,${raw_sample_rate_hz},${effective_sample_rate_hz}}  # Max 60ms jitter
 
 logspec:
   _target_: emg2qwerty.transforms.LogSpectrogram
-  n_fft: 64
-  hop_length: 16  # Downsamples from 2kHz to 125Hz
+  n_fft: ${scale_by_rate:64,${raw_sample_rate_hz},${effective_sample_rate_hz}}  # 32ms FFT window
+  hop_length: ${scale_by_rate:16,${raw_sample_rate_hz},${effective_sample_rate_hz}}  # 8ms stride -> 125Hz feature rate
 
 specaug:
   _target_: emg2qwerty.transforms.SpecAugment
@@ -28,13 +43,17 @@ specaug:
 transforms:
   train:
     - ${to_tensor}
+    - ${channel_mask}
     - ${band_rotation}
+    - ${resample}
     - ${temporal_jitter}
     - ${logspec}
     - ${specaug}
 
   val:
     - ${to_tensor}
+    - ${channel_mask}
+    - ${resample}
     - ${logspec}
 
   test: ${transforms.val}

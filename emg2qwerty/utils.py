@@ -42,3 +42,15 @@ def cpus_per_task(gpus_per_node: int, tasks_per_node: int, num_workers: int) -> 
         return num_workers + 1
     else:
         return (num_workers + 1) * gpus_per_task
+
+
+def scale_by_rate(value: int, source_hz: int, target_hz: int, minimum: int = 1) -> int:
+    """Scale a sample-count hyperparameter to preserve its duration in time."""
+    assert source_hz > 0 and target_hz > 0
+    return max(int(round(value * target_hz / source_hz)), minimum)
+
+
+def spectrogram_in_features(n_fft: int, num_channels: int) -> int:
+    """Feature size after flattening a per-channel log spectrogram frame."""
+    assert n_fft > 0 and num_channels > 0
+    return (n_fft // 2 + 1) * num_channels
