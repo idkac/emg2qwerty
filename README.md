@@ -50,31 +50,147 @@ Transformer baseline:
 python -m emg2qwerty.train user=single_user model=transformer_ctc
 ```
 
-Keep the dataset split and training hyperparameters fixed so that CER changes are attributable to the architecture.
-
-### 3) Change preprocessing or augmentation
-Transforms are defined in `config/transforms/log_spectrogram.yaml`. You can override specific values at the CLI:
+Hybrid convolution + BiLSTM model:
 
 ```bash
 python -m emg2qwerty.train \
-  user=single_user model=tds_conv_ctc \
-  transforms.specaug.n_time_masks=0 \
-  transforms.specaug.n_freq_masks=0
+  user=single_user \
+  model=tds_conv_lstm_ctc \
+  trainer.accelerator=gpu trainer.devices=1
 ```
 
-Track how `val/CER` changes relative to the baseline.
+Keep the dataset split and training hyperparameters fixed so that CER changes are attributable to the architecture.
 
-### 4) Vary data amount
-Create new user configs (for example, `config/user/single_user_50.yaml`) that include fewer training sessions. Then run:
+### 3) Change preprocessing or augmentation
+Transforms are defined in `config/transforms/log_spectrogram.yaml`. The active transform keys are top-level Hydra overrides such as `specaug.*`, `band_rotation.*`, `temporal_jitter.*`, `channel_mask.*`, and `effective_sample_rate_hz`.
+
+Turn SpecAugment off while leaving everything else unchanged:
 
 ```bash
-python -m emg2qwerty.train user=single_user_50 model=tds_conv_ctc
+python -m emg2qwerty.train \
+  user=single_user \
+  model=tds_conv_lstm_ctc \
+  trainer.accelerator=gpu trainer.devices=1 \
+  specaug.n_time_masks=0 \
+  specaug.n_freq_masks=0
+```
+
+Turn band rotation off:
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user \
+  model=tds_conv_lstm_ctc \
+  trainer.accelerator=gpu trainer.devices=1 \
+  'band_rotation.transform.offsets=[0]'
+```
+
+Reduce temporal jitter from the default 60 ms to 30 ms:
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user \
+  model=tds_conv_lstm_ctc \
+  trainer.accelerator=gpu trainer.devices=1 \
+  temporal_jitter.max_offset=60
+```
+
+Combine common preprocessing ablations:
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user \
+  model=tds_conv_lstm_ctc \
+  trainer.accelerator=gpu trainer.devices=1 \
+  'band_rotation.transform.offsets=[0]' \
+  specaug.n_time_masks=0 \
+  specaug.n_freq_masks=0
+```
+
+Track how `val/CER` changes relative to the baseline, and only compare `test/CER` for the best settings.
+
+### 4) Vary data amount
+Reduced single-user train splits are already included:
+
+- `config/user/single_user_25.yaml`
+- `config/user/single_user_50.yaml`
+- `config/user/single_user_75.yaml`
+- `config/user/single_user.yaml` for the full split
+
+Example commands:
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user_25 \
+  model=tds_conv_lstm_ctc \
+  trainer.accelerator=gpu trainer.devices=1
+```
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user_50 \
+  model=tds_conv_lstm_ctc \
+  trainer.accelerator=gpu trainer.devices=1
+```
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user_75 \
+  model=tds_conv_lstm_ctc \
+  trainer.accelerator=gpu trainer.devices=1
+```
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user \
+  model=tds_conv_lstm_ctc \
+  trainer.accelerator=gpu trainer.devices=1
 ```
 
 Plot CER versus percent of training sessions used.
 
 ### 5) Vary channels or sampling rate
-The notebooks in `notebooks/` include helper transforms for channel masking and temporal downsampling that let you keep model shapes fixed while simulating fewer channels or lower sampling rate. Use those notebooks for controlled sweeps and record CER trends.
+The repo now supports both directly from Hydra overrides.
+
+Channel-count sweep. `channel_mask.num_channels` keeps that many channels per EMG device/band and zeroes the rest while keeping tensor shapes fixed:
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user \
+  model=tds_conv_lstm_ctc \
+  trainer.accelerator=gpu trainer.devices=1 \
+  channel_mask.num_channels=12
+```
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user \
+  model=tds_conv_lstm_ctc \
+  trainer.accelerator=gpu trainer.devices=1 \
+  'channel_mask.num_channels=16,12,8,6,4,2' \
+  --multirun
+```
+
+Sampling-rate sweep. The raw dataset is 2 kHz, and overriding `effective_sample_rate_hz` automatically updates the EMG resampler, temporal jitter in samples, spectrogram window/hop, and model `in_features`:
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user \
+  model=tds_conv_lstm_ctc \
+  effective_sample_rate_hz=1000 \
+  trainer.accelerator=gpu trainer.devices=1
+```
+
+```bash
+python -m emg2qwerty.train \
+  user=single_user \
+  model=tds_conv_lstm_ctc \
+  'effective_sample_rate_hz=2000,1000,500,250' \
+  trainer.accelerator=gpu trainer.devices=1 \
+  --multirun
+```
+
+To study the effect of one modifier cleanly, keep the others fixed. For example, if you are sweeping channels, do not also sweep sampling rate or preprocessing in the same set of runs.
 
 # emg2qwerty
 [ [`Paper`](https://arxiv.org/abs/2410.20081) ] [ [`Dataset`](https://fb-ctrl-oss.s3.amazonaws.com/emg2qwerty/emg2qwerty-data-2021-08.tar.gz) ] [ [`Blog`](https://ai.meta.com/blog/open-sourcing-surface-electromyography-datasets-neurips-2024/) ] [ [`BibTeX`](#citing-emg2qwerty) ]
